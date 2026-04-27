@@ -17,6 +17,7 @@ This repository builds a multimodal model using:
 
 - protein sequence embeddings from ProtBERT
 - protein sequence embeddings from ESM-2
+- Prot2vec Embeddings
 - polymer representations from Transpolymer2
 - handcrafted sequence descriptors
 - polymer chemistry descriptors
