@@ -1,0 +1,28 @@
+# Core scientific Python
+numpy
+pandas
+scikit-learn
+scipy
+matplotlib
+tqdm
+joblib
+
+# Machine learning models
+lightgbm
+xgboost
+shap
+
+# Deep learning
+torch
+torchvision
+torchaudio
+transformers
+sentencepiece
+huggingface_hub
+
+# Protein and chemistry utilities
+biopython
+rdkit
+
+# Graph neural network utilities
+torch-geometric
