@@ -1,0 +1,674 @@
+# =========================================================
+# FINAL MULTIMODAL INPUT PREPARATION
+# ProtBERT + ESM-2 concatenated embeddings
+# + stronger handcrafted sequence descriptors
+# + polymer chemistry descriptors
+# + SMILES fingerprint
+# + fixed untrained GAT graph embeddings
+# + Transpolymer2 embeddings
+#
+# Inputs:
+#   plastizyme_protbert_esm2_model_input.csv
+#   Plastizyme_with_transpolymer2_embeddings.csv
+#
+# Output:
+#   plastizyme_final_multimodal_with_transpolymer2_model_input.csv
+# =========================================================
+
+# =========================================================
+# INSTALLS
+# =========================================================
+!pip install -q biopython rdkit-pypi
+!python -m pip install -U rdkit
+!pip install -q torch torchvision torchaudio
+!pip install -q torch-geometric
+
+# =========================================================
+# IMPORTS
+# =========================================================
+import random
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+
+from collections import Counter
+from Bio.SeqUtils.ProtParam import ProteinAnalysis
+
+from rdkit import Chem, DataStructs
+from rdkit.Chem import Descriptors, rdMolDescriptors, Crippen, Lipinski, AllChem
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader
+from torch_geometric.nn import GATConv, global_mean_pool, global_max_pool
+
+# =========================================================
+# SETTINGS
+# =========================================================
+BASE_INPUT_CSV = "/content/plastizyme_protbert_esm2_model_input.csv"
+TRANSPOLYMER_INPUT_CSV = "/content/Plastizyme_with_transpolymer2_embeddings.csv"
+OUTPUT_CSV = "/content/plastizyme_final_multimodal_with_transpolymer2_model_input.csv"
+
+SEQUENCE_COL = "sequence"
+TARGET_COL = "degradation_label"
+POLYMER_SMILES_COL = "repeat_unit_smiles"
+
+RANDOM_STATE = 42
+
+# Fingerprint settings
+FINGERPRINT_RADIUS = 2
+FINGERPRINT_NBITS = 1024
+
+# Fixed untrained GAT settings
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+GAT_BATCH_SIZE = 64
+GAT_HIDDEN_DIM = 64
+GAT_NUM_LAYERS = 3
+GAT_NUM_HEADS = 4
+GAT_DROPOUT = 0.3
+GAT_ATTN_DROPOUT = 0.0
+GAT_CONCAT_HEADS = True
+GAT_POOL = "mean"
+GAT_RESIDUAL = True
+GAT_USE_BATCHNORM = True
+
+# terminal composition
+NTERM_K = 10
+CTERM_K = 10
+
+# =========================================================
+# REPRODUCIBILITY
+# =========================================================
+def seed_everything(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+seed_everything(RANDOM_STATE)
+
+# =========================================================
+# CONSTANTS
+# =========================================================
+AA_ORDER = list("ACDEFGHIKLMNPQRSTVWY")
+AA_SET = set(AA_ORDER)
+DIPEPTIDES = [a + b for a in AA_ORDER for b in AA_ORDER]
+
+AA_GROUPS = {
+    "aliphatic": set("GAVLMI"),
+    "aromatic": set("FYW"),
+    "positive": set("KRH"),
+    "negative": set("DE"),
+    "uncharged": set("STCPNQ")
+}
+GROUP_NAMES = list(AA_GROUPS.keys())
+GROUP_DIPEPTIDES = [g1 + "_" + g2 for g1 in GROUP_NAMES for g2 in GROUP_NAMES]
+
+CTD_PROPERTIES = {
+    "hydrophobicity": [set("RKEDQN"), set("GASTPHY"), set("CLVIMFW")],
+    "normwaalsvolume": [set("GASTPDC"), set("NVEQIL"), set("MHKFRYW")],
+    "polarity": [set("LIFWCMVY"), set("PATGS"), set("HQRKNED")],
+    "polarizability": [set("GASDT"), set("CPNVEQIL"), set("KMHFRYW")],
+    "charge": [set("KR"), set("ANCQGHILMFPSTWYV"), set("DE")],
+    "secondarystruct": [set("EALMQKRH"), set("VIYCWFT"), set("GNPSD")],
+    "solventaccess": [set("ALFCGIVW"), set("RKQEND"), set("MPSTHY")]
+}
+
+# =========================================================
+# SEQUENCE FEATURE HELPERS
+# =========================================================
+def clean_seq(seq):
+    seq = str(seq).upper().strip()
+    seq = "".join([aa if aa in AA_SET else "A" for aa in seq])
+    return seq if len(seq) > 0 else "A"
+
+def shannon_entropy(seq):
+    n = len(seq)
+    if n == 0:
+        return 0.0
+    counts = Counter(seq)
+    probs = np.array([v / n for v in counts.values()], dtype=float)
+    return float(-(probs * np.log2(probs + 1e-12)).sum())
+
+def longest_homopolymer_run(seq):
+    if len(seq) == 0:
+        return 0
+    best, cur = 1, 1
+    for i in range(1, len(seq)):
+        if seq[i] == seq[i - 1]:
+            cur += 1
+            best = max(best, cur)
+        else:
+            cur = 1
+    return best
+
+def aa_composition(seq):
+    n = len(seq)
+    return {f"aa_{aa}": seq.count(aa) / n if n > 0 else 0.0 for aa in AA_ORDER}
+
+def dipeptide_comp(seq):
+    total = max(len(seq) - 1, 1)
+    counts = dict.fromkeys(DIPEPTIDES, 0)
+    for i in range(len(seq) - 1):
+        dp = seq[i:i+2]
+        if dp in counts:
+            counts[dp] += 1
+    return {f"dp_{dp}": counts[dp] / total for dp in DIPEPTIDES}
+
+def residue_to_group(aa):
+    for g, aset in AA_GROUPS.items():
+        if aa in aset:
+            return g
+    return "uncharged"
+
+def grouped_aa_comp(seq):
+    n = len(seq)
+    out = {}
+    for g, aset in AA_GROUPS.items():
+        out[f"gaa_{g}"] = sum(seq.count(a) for a in aset) / n if n > 0 else 0.0
+    return out
+
+def grouped_dipeptide_comp(seq):
+    total = max(len(seq) - 1, 1)
+    counts = dict.fromkeys(GROUP_DIPEPTIDES, 0)
+    for i in range(len(seq) - 1):
+        g1 = residue_to_group(seq[i])
+        g2 = residue_to_group(seq[i + 1])
+        counts[f"{g1}_{g2}"] += 1
+    return {f"gdp_{k}": v / total for k, v in counts.items()}
+
+def grouped_k_spaced_pairs(seq, k=1):
+    total = max(len(seq) - k - 1, 1)
+    counts = dict.fromkeys(GROUP_DIPEPTIDES, 0)
+    for i in range(len(seq) - k - 1):
+        g1 = residue_to_group(seq[i])
+        g2 = residue_to_group(seq[i + k + 1])
+        counts[f"{g1}_{g2}"] += 1
+    return {f"gsp{k}_{kk}": vv / total for kk, vv in counts.items()}
+
+def terminal_composition(seq, k=10):
+    nterm = seq[:k]
+    cterm = seq[-k:]
+    out = {}
+    nk = max(len(nterm), 1)
+    ck = max(len(cterm), 1)
+    for aa in AA_ORDER:
+        out[f"nterm_{k}_{aa}"] = nterm.count(aa) / nk
+        out[f"cterm_{k}_{aa}"] = cterm.count(aa) / ck
+    return out
+
+def complexity_features(seq):
+    n = len(seq)
+    uniq = len(set(seq))
+    counts = Counter(seq)
+
+    most_common_frac = counts.most_common(1)[0][1] / n if n > 0 else 0.0
+    small_res = sum(seq.count(a) for a in "AGSTP") / n if n > 0 else 0.0
+    disorder_like = sum(seq.count(a) for a in "AGQSEKPR") / n if n > 0 else 0.0
+    sulfur = sum(seq.count(a) for a in "CM") / n if n > 0 else 0.0
+    amide = sum(seq.count(a) for a in "NQ") / n if n > 0 else 0.0
+
+    return {
+        "seq_entropy": shannon_entropy(seq),
+        "unique_residue_fraction": uniq / 20.0,
+        "most_common_residue_fraction": most_common_frac,
+        "longest_homopolymer_run": longest_homopolymer_run(seq),
+        "small_residue_fraction": small_res,
+        "disorder_like_fraction": disorder_like,
+        "sulfur_fraction": sulfur,
+        "amide_fraction": amide
+    }
+
+def physicochem(seq):
+    p = ProteinAnalysis(seq)
+    aa = p.get_amino_acids_percent()
+    helix, turn, sheet = p.secondary_structure_fraction()
+
+    return {
+        "length": len(seq),
+        "log_length": np.log1p(len(seq)),
+        "aromaticity": p.aromaticity(),
+        "instability": p.instability_index(),
+        "pI": p.isoelectric_point(),
+        "gravy": p.gravy(),
+        "mw": p.molecular_weight(),
+        "charge_pH7": p.charge_at_pH(7.0),
+        "charge_density_pH7": p.charge_at_pH(7.0) / max(len(seq), 1),
+        "helix": helix,
+        "turn": turn,
+        "sheet": sheet,
+        "hydrophobic_fraction": sum(aa.get(x, 0) for x in ["A", "I", "L", "M", "F", "W", "V", "Y"]),
+        "positive_fraction": sum(aa.get(x, 0) for x in ["K", "R", "H"]),
+        "negative_fraction": sum(aa.get(x, 0) for x in ["D", "E"]),
+        "polar_fraction": sum(aa.get(x, 0) for x in ["N", "C", "Q", "S", "T", "Y"]),
+        "tiny_fraction": sum(aa.get(x, 0) for x in ["A", "C", "G", "S", "T"]),
+        "branched_fraction": sum(aa.get(x, 0) for x in ["I", "L", "V"]),
+        "proline_fraction": aa.get("P", 0),
+        "glycine_fraction": aa.get("G", 0)
+    }
+
+def ctd_features(seq):
+    out = {}
+    n = len(seq)
+
+    for prop_name, groups in CTD_PROPERTIES.items():
+        labels = []
+        for aa in seq:
+            if aa in groups[0]:
+                labels.append(1)
+            elif aa in groups[1]:
+                labels.append(2)
+            else:
+                labels.append(3)
+
+        for c in [1, 2, 3]:
+            out[f"ctd_{prop_name}_C{c}"] = labels.count(c) / n if n > 0 else 0.0
+
+        total_trans = max(len(labels) - 1, 1)
+        t12 = t13 = t23 = 0
+        for i in range(len(labels) - 1):
+            pair = {labels[i], labels[i + 1]}
+            if pair == {1, 2}:
+                t12 += 1
+            elif pair == {1, 3}:
+                t13 += 1
+            elif pair == {2, 3}:
+                t23 += 1
+        out[f"ctd_{prop_name}_T12"] = t12 / total_trans
+        out[f"ctd_{prop_name}_T13"] = t13 / total_trans
+        out[f"ctd_{prop_name}_T23"] = t23 / total_trans
+
+        for c in [1, 2, 3]:
+            pos = [i + 1 for i, lab in enumerate(labels) if lab == c]
+            if len(pos) == 0:
+                vals = [0, 0, 0, 0, 0]
+            else:
+                percentiles = [0, 25, 50, 75, 100]
+                vals = [np.percentile(pos, p) / n for p in percentiles]
+            for idx, v in enumerate(vals, start=1):
+                out[f"ctd_{prop_name}_D{c}_{idx}"] = float(v)
+
+    return out
+
+def extract_features(seq):
+    seq = clean_seq(seq)
+    feat = {}
+    feat.update(physicochem(seq))
+    feat.update(complexity_features(seq))
+    feat.update(aa_composition(seq))
+    feat.update(dipeptide_comp(seq))
+    feat.update(grouped_aa_comp(seq))
+    feat.update(grouped_dipeptide_comp(seq))
+    feat.update(grouped_k_spaced_pairs(seq, k=1))
+    feat.update(grouped_k_spaced_pairs(seq, k=2))
+    feat.update(terminal_composition(seq, k=NTERM_K))
+    feat.update(ctd_features(seq))
+    return feat
+
+# =========================================================
+# POLYMER DESCRIPTORS + FINGERPRINTS
+# =========================================================
+def compute_polymer_descriptor_dict(smiles):
+    mol = Chem.MolFromSmiles(str(smiles).strip())
+    if mol is None:
+        return {
+            "poly_molwt": np.nan,
+            "poly_exactmolwt": np.nan,
+            "poly_logp": np.nan,
+            "poly_tpsa": np.nan,
+            "poly_hbd": np.nan,
+            "poly_hba": np.nan,
+            "poly_rotbonds": np.nan,
+            "poly_rings": np.nan,
+            "poly_aromatic_rings": np.nan,
+            "poly_fraction_csp3": np.nan,
+            "poly_heavy_atoms": np.nan,
+            "poly_hetero_atoms": np.nan,
+            "poly_valence_electrons": np.nan,
+            "poly_mr": np.nan,
+            "poly_nhohcount": np.nan,
+            "poly_no_count": np.nan,
+            "poly_aliphatic_rings": np.nan,
+            "poly_saturated_rings": np.nan,
+            "poly_aromatic_atoms_fraction": np.nan,
+            "poly_hetero_atoms_fraction": np.nan
+        }
+
+    heavy_atoms = mol.GetNumHeavyAtoms()
+    aromatic_atoms = sum(atom.GetIsAromatic() for atom in mol.GetAtoms())
+    hetero_atoms = sum(atom.GetAtomicNum() not in [1, 6] for atom in mol.GetAtoms())
+
+    return {
+        "poly_molwt": Descriptors.MolWt(mol),
+        "poly_exactmolwt": Descriptors.ExactMolWt(mol),
+        "poly_logp": Crippen.MolLogP(mol),
+        "poly_tpsa": rdMolDescriptors.CalcTPSA(mol),
+        "poly_hbd": Lipinski.NumHDonors(mol),
+        "poly_hba": Lipinski.NumHAcceptors(mol),
+        "poly_rotbonds": Lipinski.NumRotatableBonds(mol),
+        "poly_rings": Lipinski.RingCount(mol),
+        "poly_aromatic_rings": Lipinski.NumAromaticRings(mol),
+        "poly_fraction_csp3": Lipinski.FractionCSP3(mol),
+        "poly_heavy_atoms": heavy_atoms,
+        "poly_hetero_atoms": hetero_atoms,
+        "poly_valence_electrons": Descriptors.NumValenceElectrons(mol),
+        "poly_mr": Crippen.MolMR(mol),
+        "poly_nhohcount": Lipinski.NHOHCount(mol),
+        "poly_no_count": Lipinski.NOCount(mol),
+        "poly_aliphatic_rings": Lipinski.NumAliphaticRings(mol),
+        "poly_saturated_rings": Lipinski.NumSaturatedRings(mol),
+        "poly_aromatic_atoms_fraction": aromatic_atoms / max(1, mol.GetNumAtoms()),
+        "poly_hetero_atoms_fraction": hetero_atoms / max(1, mol.GetNumAtoms())
+    }
+
+def compute_fingerprint_array(smiles, radius=2, n_bits=1024):
+    mol = Chem.MolFromSmiles(str(smiles).strip())
+    arr = np.zeros((n_bits,), dtype=np.float32)
+    if mol is None:
+        return arr
+    fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
+    DataStructs.ConvertToNumpyArray(fp, arr)
+    return arr
+
+# =========================================================
+# FIXED UNTRAINED GAT
+# =========================================================
+AMINO_ACIDS = list("ACDEFGHIKLMNPQRSTVWY")
+AA_TO_IDX = {aa: i for i, aa in enumerate(AMINO_ACIDS)}
+UNK_INDEX = len(AMINO_ACIDS)
+NUM_NODE_FEATURES = len(AMINO_ACIDS) + 1
+
+def one_hot_encode_sequence(seq):
+    x = np.zeros((len(seq), NUM_NODE_FEATURES), dtype=np.float32)
+    for i, aa in enumerate(seq):
+        idx = AA_TO_IDX.get(aa, UNK_INDEX)
+        x[i, idx] = 1.0
+    return x
+
+def build_chain_edge_index(seq_len):
+    if seq_len == 1:
+        return torch.tensor([[0], [0]], dtype=torch.long)
+
+    src, dst = [], []
+    for i in range(seq_len):
+        src.append(i)
+        dst.append(i)
+    for i in range(seq_len - 1):
+        src.extend([i, i + 1])
+        dst.extend([i + 1, i])
+
+    return torch.tensor([src, dst], dtype=torch.long)
+
+def sequence_to_graph(sequence, label=0):
+    seq = clean_seq(sequence)
+    x = torch.tensor(one_hot_encode_sequence(seq), dtype=torch.float)
+    edge_index = build_chain_edge_index(len(seq))
+    y = torch.tensor(label, dtype=torch.long)
+    return Data(x=x, edge_index=edge_index, y=y)
+
+class StandardGATEncoder(nn.Module):
+    def __init__(
+        self,
+        in_dim,
+        hidden_dim=64,
+        num_gat_layers=3,
+        num_heads=4,
+        dropout=0.3,
+        attn_dropout=0.0,
+        concat_heads=True,
+        pool="mean",
+        residual=True,
+        use_batchnorm=True,
+    ):
+        super().__init__()
+        self.pool = pool
+        self.residual = residual
+        self.dropout = dropout
+
+        self.input_proj = nn.Linear(in_dim, hidden_dim)
+        self.convs = nn.ModuleList()
+        self.bns = nn.ModuleList()
+
+        current_dim = hidden_dim
+        for _ in range(num_gat_layers):
+            conv = GATConv(
+                in_channels=current_dim,
+                out_channels=hidden_dim,
+                heads=num_heads,
+                concat=concat_heads,
+                dropout=attn_dropout,
+                add_self_loops=False,
+            )
+            self.convs.append(conv)
+            next_dim = hidden_dim * num_heads if concat_heads else hidden_dim
+            self.bns.append(nn.BatchNorm1d(next_dim) if use_batchnorm else nn.Identity())
+            current_dim = next_dim
+
+        self.graph_dim = current_dim
+
+    def encode_graph(self, data):
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+        x = self.input_proj(x)
+
+        for conv, bn in zip(self.convs, self.bns):
+            x_in = x
+            x = conv(x, edge_index)
+            x = bn(x)
+            x = F.elu(x)
+            x = F.dropout(x, p=self.dropout, training=False)
+            if self.residual and x.shape == x_in.shape:
+                x = x + x_in
+
+        if self.pool == "mean":
+            g = global_mean_pool(x, batch)
+        else:
+            g = global_max_pool(x, batch)
+        return g
+
+@torch.no_grad()
+def extract_gat_embeddings(model, loader, device):
+    model.eval()
+    all_emb = []
+    for batch in loader:
+        batch = batch.to(device)
+        g = model.encode_graph(batch)
+        all_emb.append(g.cpu().numpy())
+    return np.vstack(all_emb)
+
+# =========================================================
+# HELPER: MERGE TRANSPOLYMER2 EMBEDDINGS
+# =========================================================
+def prepare_string_col(s):
+    return s.astype(str).str.strip()
+
+def prepare_sequence_col(s):
+    return s.astype(str).str.strip().str.upper()
+
+def merge_transpolymer_embeddings(base_df, tp_df):
+    tp2_cols = [c for c in tp_df.columns if c.startswith("transpolymer2_")]
+    if len(tp2_cols) == 0:
+        raise ValueError("No Transpolymer2 columns found in TRANSPOLYMER_INPUT_CSV. Expected columns starting with 'transpolymer2_'.")
+
+    # Standardize possible merge columns
+    for df_ in [base_df, tp_df]:
+        if SEQUENCE_COL in df_.columns:
+            df_[SEQUENCE_COL] = prepare_sequence_col(df_[SEQUENCE_COL])
+        if POLYMER_SMILES_COL in df_.columns:
+            df_[POLYMER_SMILES_COL] = prepare_string_col(df_[POLYMER_SMILES_COL])
+        if TARGET_COL in df_.columns:
+            df_[TARGET_COL] = pd.to_numeric(df_[TARGET_COL], errors="coerce")
+        for c in ["polymer_family", "polymer_name"]:
+            if c in df_.columns:
+                df_[c] = prepare_string_col(df_[c])
+
+    # Prefer stronger merge keys when available
+    candidate_keys = ["sequence", "repeat_unit_smiles", "degradation_label", "polymer_family", "polymer_name"]
+    merge_keys = [c for c in candidate_keys if c in base_df.columns and c in tp_df.columns]
+
+    if len(merge_keys) == 0:
+        raise ValueError(
+            "Could not find shared merge keys between the base file and the Transpolymer file. "
+            "At minimum, they should share 'sequence', preferably with repeat_unit_smiles and/or other metadata."
+        )
+
+    print("\nMerging Transpolymer2 embeddings using keys:", merge_keys)
+
+    tp_keep = merge_keys + tp2_cols
+    tp_small = tp_df[tp_keep].copy()
+
+    # Drop exact duplicates in transpolymer file for the chosen keys
+    tp_small = tp_small.drop_duplicates(subset=merge_keys).copy()
+
+    merged = base_df.merge(tp_small, on=merge_keys, how="left", validate="m:1")
+
+    missing_rows = merged[tp2_cols].isna().all(axis=1).sum()
+    if missing_rows > 0:
+        raise ValueError(
+            f"{missing_rows} rows in the base input did not receive Transpolymer2 embeddings after merge. "
+            f"Check whether the two files use matching values for the merge keys: {merge_keys}"
+        )
+
+    print("Transpolymer2 columns found:", len(tp2_cols))
+    print("Rows successfully matched to Transpolymer2 embeddings:", len(merged) - missing_rows)
+
+    return merged, tp2_cols
+
+# =========================================================
+# LOAD BASE DATA
+# =========================================================
+base_df = pd.read_csv(BASE_INPUT_CSV).copy()
+
+required_cols = [SEQUENCE_COL, TARGET_COL, POLYMER_SMILES_COL]
+missing_cols = [c for c in required_cols if c not in base_df.columns]
+if missing_cols:
+    raise ValueError(f"Missing required columns in BASE_INPUT_CSV: {missing_cols}")
+
+base_df = base_df.dropna(subset=[SEQUENCE_COL, TARGET_COL, POLYMER_SMILES_COL]).reset_index(drop=True)
+base_df[SEQUENCE_COL] = base_df[SEQUENCE_COL].astype(str)
+base_df[POLYMER_SMILES_COL] = base_df[POLYMER_SMILES_COL].astype(str).str.strip()
+base_df[TARGET_COL] = pd.to_numeric(base_df[TARGET_COL], errors="coerce")
+base_df = base_df.dropna(subset=[TARGET_COL]).reset_index(drop=True)
+base_df[TARGET_COL] = base_df[TARGET_COL].astype(int)
+
+seq_embed_cols = [c for c in base_df.columns if c.startswith("seq_embed_")]
+protbert_cols = [c for c in base_df.columns if c.startswith("protbert_")]
+esm2_cols = [c for c in base_df.columns if c.startswith("esm2_")]
+
+if len(seq_embed_cols) == 0:
+    raise ValueError("No concatenated sequence embedding columns found. Expected columns starting with 'seq_embed_'.")
+
+print("Base input rows:", len(base_df))
+print("Concatenated seq embedding columns:", len(seq_embed_cols))
+print("ProtBERT columns:", len(protbert_cols))
+print("ESM-2 columns:", len(esm2_cols))
+print("Device:", DEVICE)
+
+# =========================================================
+# LOAD + MERGE TRANSPOLYMER2 DATA
+# =========================================================
+tp_df = pd.read_csv(TRANSPOLYMER_INPUT_CSV).copy()
+df, tp2_cols = merge_transpolymer_embeddings(base_df, tp_df)
+
+print("Rows after merge:", len(df))
+
+# =========================================================
+# HANDCRAFTED FEATURES
+# =========================================================
+print("\nComputing stronger handcrafted sequence descriptors...")
+handcrafted_df = pd.DataFrame([extract_features(seq) for seq in df[SEQUENCE_COL].values])
+
+# =========================================================
+# POLYMER DESCRIPTORS
+# =========================================================
+print("Computing polymer chemistry descriptors...")
+poly_desc_df = pd.DataFrame([compute_polymer_descriptor_dict(s) for s in df[POLYMER_SMILES_COL].values])
+
+# =========================================================
+# FINGERPRINTS
+# =========================================================
+print("Computing Morgan fingerprints...")
+fp_array = np.vstack([
+    compute_fingerprint_array(s, radius=FINGERPRINT_RADIUS, n_bits=FINGERPRINT_NBITS)
+    for s in df[POLYMER_SMILES_COL].values
+])
+fp_cols = [f"fp_{i}" for i in range(FINGERPRINT_NBITS)]
+fp_df = pd.DataFrame(fp_array, columns=fp_cols)
+
+# =========================================================
+# FIXED GAT EMBEDDINGS
+# =========================================================
+print("Extracting fixed untrained GAT embeddings...")
+
+torch.manual_seed(RANDOM_STATE)
+torch.cuda.manual_seed_all(RANDOM_STATE)
+
+graphs = [sequence_to_graph(seq, int(y)) for seq, y in zip(df[SEQUENCE_COL].values, df[TARGET_COL].values)]
+loader = DataLoader(graphs, batch_size=GAT_BATCH_SIZE, shuffle=False)
+
+gat_model = StandardGATEncoder(
+    in_dim=NUM_NODE_FEATURES,
+    hidden_dim=GAT_HIDDEN_DIM,
+    num_gat_layers=GAT_NUM_LAYERS,
+    num_heads=GAT_NUM_HEADS,
+    dropout=GAT_DROPOUT,
+    attn_dropout=GAT_ATTN_DROPOUT,
+    concat_heads=GAT_CONCAT_HEADS,
+    pool=GAT_POOL,
+    residual=GAT_RESIDUAL,
+    use_batchnorm=GAT_USE_BATCHNORM,
+).to(DEVICE)
+
+gat_emb = extract_gat_embeddings(gat_model, loader, DEVICE)
+gat_cols = [f"gat_emb_{i}" for i in range(gat_emb.shape[1])]
+gat_df = pd.DataFrame(gat_emb, columns=gat_cols)
+
+# =========================================================
+# FINAL CONCATENATION
+# =========================================================
+metadata_cols = []
+for c in [
+    "polymer_name",
+    "polymer_family",
+    "repeat_unit_smiles",
+    "sequence",
+    "degradation_label",
+    "amide_flag",
+    "aromatic_flag",
+    "ester_flag",
+    "ether_flag",
+    "hydrocarbon_flag",
+    "urethane_flag"
+]:
+    if c in df.columns:
+        metadata_cols.append(c)
+
+final_df = pd.concat([
+    df[metadata_cols].reset_index(drop=True),
+    handcrafted_df.reset_index(drop=True),
+    df[seq_embed_cols].reset_index(drop=True),
+    poly_desc_df.reset_index(drop=True),
+    fp_df.reset_index(drop=True),
+    gat_df.reset_index(drop=True),
+    df[tp2_cols].reset_index(drop=True)
+], axis=1)
+
+# =========================================================
+# SAVE
+# =========================================================
+final_df.to_csv(OUTPUT_CSV, index=False)
+
+print("\nSaved final multimodal input file:")
+print(" -", OUTPUT_CSV)
+print("Final shape:", final_df.shape)
+print("Metadata columns:", len(metadata_cols))
+print("Handcrafted features:", handcrafted_df.shape[1])
+print("Sequence embedding features:", len(seq_embed_cols))
+print("Polymer descriptor features:", poly_desc_df.shape[1])
+print("Fingerprint features:", fp_df.shape[1])
+print("GAT embedding features:", gat_df.shape[1])
+print("Transpolymer2 features:", len(tp2_cols))
