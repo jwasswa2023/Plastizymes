@@ -690,6 +690,10 @@ If using this repository, cite the associated Plastizymes manuscript when availa
 
 ---
 
+## Acknowldgements
+AI Use: Artificial intelligence models from OpenAI (ChatGPT), Anthropic (Claude), and Google (Gemini) were used as coding aids in the development of Plastizymes.
+
+
 ## Contact
 
 Joseph Wasswa  
