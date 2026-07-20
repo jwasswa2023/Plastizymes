@@ -1,0 +1,1102 @@
+# ============================================================
+# PLASTIZYMES: ABSOLUTE-VALUE COLORED COST-BENEFIT HEATMAP
+# FULLY CORRECTED CODE WITH VERTICAL FAVORABILITY ARROW
+# ============================================================
+#
+# Cell color:
+#   Absolute performance, cost, or reliability value
+#
+# Printed number:
+#   Relative percentage change versus the matching protein-only
+#   baseline
+#
+# Color direction:
+#   Higher is better:
+#       AUROC, AUPRC, MCC, Spearman
+#
+#   Lower is better:
+#       Feature dimensions, modeling time, ECE, Brier
+#
+# Normalization:
+#   Per metric across all 25 protein-polymer combinations
+#
+# INPUT
+#   /content/drive/MyDrive/Plastizymes/
+#   plastizymes_combined_cost_benefit_uncertainty.csv
+#
+# OUTPUTS
+#   plastizymes_absolute_colored_relative_change.csv
+#   plastizymes_absolute_colored_relative_change_arrow.png
+#   plastizymes_absolute_colored_relative_change_arrow.pdf
+# ============================================================
+
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap, Normalize
+from matplotlib.cm import ScalarMappable
+
+
+# ============================================================
+# 1. PATHS
+# ============================================================
+DATA_DIR = Path("/content/drive/MyDrive/Plastizymes")
+
+INPUT_CSV = (
+    DATA_DIR
+    / "plastizymes_combined_cost_benefit_uncertainty.csv"
+)
+
+OUTPUT_CSV = (
+    DATA_DIR
+    / "plastizymes_absolute_colored_relative_change.csv"
+)
+
+OUTPUT_PNG = (
+    DATA_DIR
+    / "plastizymes_absolute_colored_relative_change_arrow.png"
+)
+
+OUTPUT_PDF = (
+    DATA_DIR
+    / "plastizymes_absolute_colored_relative_change_arrow.pdf"
+)
+
+
+# ============================================================
+# 2. LOAD DATA
+# ============================================================
+if not INPUT_CSV.exists():
+    raise FileNotFoundError(
+        f"Input CSV not found:\n{INPUT_CSV}"
+    )
+
+df = pd.read_csv(
+    INPUT_CSV,
+    keep_default_na=False,
+).copy()
+
+required_columns = [
+    "configuration",
+    "protein_representation",
+    "polymer_representation",
+    "AUROC_mean",
+    "AUPRC_mean",
+    "MCC_mean",
+    "feature_dimensions",
+    "total_modeling_time_s_mean",
+    "ECE_mean",
+    "Brier_mean",
+    "spearman_error_uncertainty_mean",
+]
+
+missing_columns = [
+    column
+    for column in required_columns
+    if column not in df.columns
+]
+
+if missing_columns:
+    raise ValueError(
+        "Missing required columns:\n"
+        + "\n".join(missing_columns)
+    )
+
+
+# ============================================================
+# 3. CLEAN DATA
+# ============================================================
+for column in [
+    "configuration",
+    "protein_representation",
+    "polymer_representation",
+]:
+    df[column] = (
+        df[column]
+        .astype(str)
+        .str.strip()
+    )
+
+df["polymer_representation"] = (
+    df["polymer_representation"]
+    .replace({
+        "": "None",
+        "nan": "None",
+        "NaN": "None",
+        "NONE": "None",
+        "none": "None",
+    })
+)
+
+numeric_columns = [
+    "AUROC_mean",
+    "AUPRC_mean",
+    "MCC_mean",
+    "feature_dimensions",
+    "total_modeling_time_s_mean",
+    "ECE_mean",
+    "Brier_mean",
+    "spearman_error_uncertainty_mean",
+]
+
+for column in numeric_columns:
+    df[column] = pd.to_numeric(
+        df[column],
+        errors="coerce",
+    )
+
+
+# ============================================================
+# 4. DISPLAY ORDER
+# ============================================================
+protein_order = [
+    "Sequence descriptors",
+    "Prot2Vec",
+    "GAT",
+    "ESM-2",
+    "ProtBERT",
+]
+
+protein_short = {
+    "Sequence descriptors": "Seq. desc.",
+    "Prot2Vec": "Prot2Vec",
+    "GAT": "GAT",
+    "ESM-2": "ESM-2",
+    "ProtBERT": "ProtBERT",
+}
+
+polymer_order = [
+    "Polymer identity",
+    "Polymer descriptors",
+    "Morgan fingerprints",
+    "PolyBERT",
+    "TransPolymer2",
+]
+
+polymer_short = {
+    "Polymer identity": "Identity",
+    "Polymer descriptors": "Descriptors",
+    "Morgan fingerprints": "Morgan FP",
+    "PolyBERT": "PolyBERT",
+    "TransPolymer2": "TransPolymer2",
+}
+
+
+# ============================================================
+# 5. RELATIVE CHANGE FUNCTIONS
+# ============================================================
+def relative_change_higher_better(
+    new_value,
+    baseline_value,
+):
+    if (
+        pd.isna(new_value)
+        or pd.isna(baseline_value)
+        or np.isclose(baseline_value, 0.0)
+    ):
+        return np.nan
+
+    return (
+        100.0
+        * (
+            new_value
+            - baseline_value
+        )
+        / abs(baseline_value)
+    )
+
+
+def relative_change_lower_better(
+    new_value,
+    baseline_value,
+):
+    if (
+        pd.isna(new_value)
+        or pd.isna(baseline_value)
+        or np.isclose(baseline_value, 0.0)
+    ):
+        return np.nan
+
+    return (
+        100.0
+        * (
+            baseline_value
+            - new_value
+        )
+        / abs(baseline_value)
+    )
+
+
+def relative_cost_change(
+    new_value,
+    baseline_value,
+):
+    if (
+        pd.isna(new_value)
+        or pd.isna(baseline_value)
+        or np.isclose(baseline_value, 0.0)
+    ):
+        return np.nan
+
+    return (
+        100.0
+        * (
+            new_value
+            - baseline_value
+        )
+        / abs(baseline_value)
+    )
+
+
+# ============================================================
+# 6. BUILD PLOTTING DATASET
+# ============================================================
+rows = []
+
+for protein_name in protein_order:
+
+    protein_subset = df[
+        df["protein_representation"] == protein_name
+    ].copy()
+
+    baseline_match = protein_subset[
+        protein_subset[
+            "polymer_representation"
+        ] == "None"
+    ]
+
+    if len(baseline_match) != 1:
+        raise ValueError(
+            f"Expected one protein-only baseline for "
+            f"{protein_name}, found {len(baseline_match)}."
+        )
+
+    baseline = baseline_match.iloc[0]
+
+    for polymer_name in polymer_order:
+
+        model_match = protein_subset[
+            protein_subset[
+                "polymer_representation"
+            ] == polymer_name
+        ]
+
+        if len(model_match) != 1:
+            raise ValueError(
+                f"Expected one row for "
+                f"{protein_name} + {polymer_name}, "
+                f"found {len(model_match)}."
+            )
+
+        model = model_match.iloc[0]
+
+        rows.append({
+            "protein_representation":
+                protein_name,
+
+            "polymer_representation":
+                polymer_name,
+
+            "configuration":
+                model["configuration"],
+
+            # Relative changes printed in cells
+            "AUROC_change_pct":
+                relative_change_higher_better(
+                    model["AUROC_mean"],
+                    baseline["AUROC_mean"],
+                ),
+
+            "AUPRC_change_pct":
+                relative_change_higher_better(
+                    model["AUPRC_mean"],
+                    baseline["AUPRC_mean"],
+                ),
+
+            "MCC_change_pct":
+                relative_change_higher_better(
+                    model["MCC_mean"],
+                    baseline["MCC_mean"],
+                ),
+
+            "feature_dimensions_change_pct":
+                relative_cost_change(
+                    model["feature_dimensions"],
+                    baseline["feature_dimensions"],
+                ),
+
+            "total_modeling_time_change_pct":
+                relative_cost_change(
+                    model["total_modeling_time_s_mean"],
+                    baseline["total_modeling_time_s_mean"],
+                ),
+
+            "ECE_improvement_pct":
+                relative_change_lower_better(
+                    model["ECE_mean"],
+                    baseline["ECE_mean"],
+                ),
+
+            "Brier_improvement_pct":
+                relative_change_lower_better(
+                    model["Brier_mean"],
+                    baseline["Brier_mean"],
+                ),
+
+            "Spearman_change_pct":
+                relative_change_higher_better(
+                    model[
+                        "spearman_error_uncertainty_mean"
+                    ],
+                    baseline[
+                        "spearman_error_uncertainty_mean"
+                    ],
+                ),
+
+            # Absolute values used for cell colors
+            "AUROC_absolute":
+                model["AUROC_mean"],
+
+            "AUPRC_absolute":
+                model["AUPRC_mean"],
+
+            "MCC_absolute":
+                model["MCC_mean"],
+
+            "feature_dimensions_absolute":
+                model["feature_dimensions"],
+
+            "total_modeling_time_s_absolute":
+                model["total_modeling_time_s_mean"],
+
+            "ECE_absolute":
+                model["ECE_mean"],
+
+            "Brier_absolute":
+                model["Brier_mean"],
+
+            "Spearman_absolute":
+                model[
+                    "spearman_error_uncertainty_mean"
+                ],
+        })
+
+
+plot_df = pd.DataFrame(rows)
+
+protein_rank = {
+    name: index
+    for index, name in enumerate(protein_order)
+}
+
+polymer_rank = {
+    name: index
+    for index, name in enumerate(polymer_order)
+}
+
+plot_df["protein_rank"] = (
+    plot_df["protein_representation"]
+    .map(protein_rank)
+)
+
+plot_df["polymer_rank"] = (
+    plot_df["polymer_representation"]
+    .map(polymer_rank)
+)
+
+plot_df["polymer_short"] = (
+    plot_df["polymer_representation"]
+    .map(polymer_short)
+)
+
+plot_df = (
+    plot_df
+    .sort_values(
+        [
+            "protein_rank",
+            "polymer_rank",
+        ]
+    )
+    .reset_index(drop=True)
+)
+
+plot_df.to_csv(
+    OUTPUT_CSV,
+    index=False,
+)
+
+
+# ============================================================
+# 7. COLOR MAP
+# ============================================================
+absolute_cmap = LinearSegmentedColormap.from_list(
+    "plastizymes",
+    [
+        "#7B3294",   # purple (less favorable)
+        "#F7F7F7",   # neutral
+        "#008B8B",   # teal (more favorable)
+    ]
+)
+
+# ============================================================
+# 8. HELPERS
+# ============================================================
+def as_float_array(values):
+    return np.asarray(
+        pd.to_numeric(
+            values,
+            errors="coerce",
+        ),
+        dtype=float,
+    )
+
+
+def min_max_norm(
+    values,
+    higher_is_better,
+):
+    """
+    Normalize one metric across all 25 combinations.
+
+    Returns values in [0, 1], where:
+        0 = less favorable
+        1 = more favorable
+    """
+    array = as_float_array(values)
+
+    finite = array[
+        np.isfinite(array)
+    ]
+
+    if finite.size == 0:
+        return np.full_like(
+            array,
+            0.5,
+            dtype=float,
+        )
+
+    minimum = float(
+        np.min(finite)
+    )
+
+    maximum = float(
+        np.max(finite)
+    )
+
+    if np.isclose(
+        minimum,
+        maximum,
+    ):
+        normalized = np.full_like(
+            array,
+            0.5,
+            dtype=float,
+        )
+    else:
+        normalized = (
+            array
+            - minimum
+        ) / (
+            maximum
+            - minimum
+        )
+
+    if not higher_is_better:
+        normalized = (
+            1.0
+            - normalized
+        )
+
+    return normalized
+
+
+def readable_text_color(rgba):
+    red, green, blue, _ = rgba
+
+    luminance = (
+        0.299 * red
+        + 0.587 * green
+        + 0.114 * blue
+    )
+
+    return (
+        "white"
+        if luminance < 0.48
+        else "black"
+    )
+
+
+# ============================================================
+# 9. DRAW PANEL
+# ============================================================
+def draw_heatmap_panel(
+    axis,
+    data,
+    metrics,
+    show_polymer_labels=False,
+):
+    """
+    metrics is a list of tuples:
+
+        (
+            printed_change_column,
+            absolute_color_column,
+            x_axis_label,
+            higher_absolute_is_better,
+        )
+    """
+
+    n_rows = len(data)
+    n_columns = len(metrics)
+
+    change_matrix = np.zeros(
+        (
+            n_rows,
+            n_columns,
+        ),
+        dtype=float,
+    )
+
+    color_matrix = np.zeros_like(
+        change_matrix
+    )
+
+    for column_index, (
+        change_column,
+        absolute_column,
+        _,
+        higher_absolute_is_better,
+    ) in enumerate(metrics):
+
+        changes = as_float_array(
+            data[
+                change_column
+            ]
+        )
+
+        absolute_values = as_float_array(
+            data[
+                absolute_column
+            ]
+        )
+
+        change_matrix[
+            :,
+            column_index
+        ] = changes
+
+        color_matrix[
+            :,
+            column_index
+        ] = min_max_norm(
+            absolute_values,
+            higher_is_better=(
+                higher_absolute_is_better
+            ),
+        )
+
+    axis.imshow(
+        color_matrix,
+        cmap=absolute_cmap,
+        vmin=0.0,
+        vmax=1.0,
+        aspect="auto",
+        interpolation="nearest",
+        origin="upper",
+    )
+
+    # Printed numbers are relative percentage changes only.
+    for row_index in range(
+        n_rows
+    ):
+        for column_index in range(
+            n_columns
+        ):
+            change_value = change_matrix[
+                row_index,
+                column_index
+            ]
+
+            label = (
+                f"{change_value:+.1f}%"
+                if np.isfinite(change_value)
+                else "NA"
+            )
+
+            rgba = absolute_cmap(
+                color_matrix[
+                    row_index,
+                    column_index
+                ]
+            )
+
+            axis.text(
+                column_index,
+                row_index,
+                label,
+                ha="center",
+                va="center",
+                fontsize=9.1,
+                fontweight="bold",
+                color=readable_text_color(
+                    rgba
+                ),
+            )
+
+    axis.set_xticks(
+        np.arange(
+            n_columns
+        )
+    )
+
+    axis.set_xticklabels(
+        [
+            label
+            for (
+                _,
+                _,
+                label,
+                _,
+            ) in metrics
+        ],
+        fontsize=9.8,
+        linespacing=1.0,
+    )
+
+    axis.xaxis.tick_top()
+
+    axis.tick_params(
+        axis="x",
+        length=0,
+        pad=6,
+    )
+
+    axis.set_yticks(
+        np.arange(
+            n_rows
+        )
+    )
+
+    if show_polymer_labels:
+        axis.set_yticklabels(
+            data[
+                "polymer_short"
+            ],
+            fontsize=9.0,
+        )
+    else:
+        axis.set_yticklabels([])
+
+    axis.tick_params(
+        axis="y",
+        length=0,
+        pad=5,
+    )
+
+    axis.set_xticks(
+        np.arange(
+            -0.5,
+            n_columns,
+            1.0,
+        ),
+        minor=True,
+    )
+
+    axis.set_yticks(
+        np.arange(
+            -0.5,
+            n_rows,
+            1.0,
+        ),
+        minor=True,
+    )
+
+    axis.grid(
+        which="minor",
+        color="white",
+        linewidth=0.8,
+    )
+
+    axis.tick_params(
+        which="minor",
+        bottom=False,
+        left=False,
+    )
+
+    for boundary in [
+        4.5,
+        9.5,
+        14.5,
+        19.5,
+    ]:
+        axis.axhline(
+            boundary,
+            color="black",
+            linewidth=1.5,
+        )
+
+    axis.set_xlim(
+        -0.5,
+        n_columns - 0.5,
+    )
+
+    axis.set_ylim(
+        n_rows - 0.5,
+        -0.5,
+    )
+
+
+# ============================================================
+# 10. PROTEIN GROUP LABELS
+# ============================================================
+def add_protein_group_labels(
+    axis,
+):
+    rows_per_group = len(
+        polymer_order
+    )
+
+    for group_index, protein_name in enumerate(
+        protein_order
+    ):
+        start = (
+            group_index
+            * rows_per_group
+        )
+
+        end = (
+            start
+            + rows_per_group
+            - 1
+        )
+
+        midpoint = (
+            start
+            + end
+        ) / 2.0
+
+        axis.text(
+            -1.62,
+            midpoint,
+            protein_short[
+                protein_name
+            ],
+            ha="center",
+            va="center",
+            rotation=90,
+            fontsize=10.0,
+            fontweight="bold",
+            clip_on=False,
+        )
+
+
+# ============================================================
+# 11. METRIC DEFINITIONS
+# ============================================================
+performance_metrics = [
+    (
+        "AUROC_change_pct",
+        "AUROC_absolute",
+        "AUROC",
+        True,
+    ),
+    (
+        "AUPRC_change_pct",
+        "AUPRC_absolute",
+        "AUPRC",
+        True,
+    ),
+    (
+        "MCC_change_pct",
+        "MCC_absolute",
+        "MCC",
+        True,
+    ),
+]
+
+cost_metrics = [
+    (
+        "feature_dimensions_change_pct",
+        "feature_dimensions_absolute",
+        "Features",
+        False,
+    ),
+    (
+        "total_modeling_time_change_pct",
+        "total_modeling_time_s_absolute",
+        "Modeling time",
+        False,
+    ),
+]
+
+reliability_metrics = [
+    (
+        "ECE_improvement_pct",
+        "ECE_absolute",
+        "ECE",
+        False,
+    ),
+    (
+        "Brier_improvement_pct",
+        "Brier_absolute",
+        "Brier",
+        False,
+    ),
+    (
+        "Spearman_change_pct",
+        "Spearman_absolute",
+        "Spearman",
+        True,
+    ),
+]
+
+
+# ============================================================
+# 12. CREATE FIGURE
+# ============================================================
+figure = plt.figure(
+    figsize=(
+        11.2,
+        8.0,
+    )
+)
+
+grid = figure.add_gridspec(
+    nrows=1,
+    ncols=3,
+    width_ratios=[
+        3.15,
+        2.10,
+        3.15,
+    ],
+    wspace=0.10,
+)
+
+performance_axis = figure.add_subplot(
+    grid[0, 0]
+)
+
+cost_axis = figure.add_subplot(
+    grid[0, 1]
+)
+
+reliability_axis = figure.add_subplot(
+    grid[0, 2]
+)
+
+draw_heatmap_panel(
+    axis=performance_axis,
+    data=plot_df,
+    metrics=performance_metrics,
+    show_polymer_labels=True,
+)
+
+draw_heatmap_panel(
+    axis=cost_axis,
+    data=plot_df,
+    metrics=cost_metrics,
+    show_polymer_labels=False,
+)
+
+draw_heatmap_panel(
+    axis=reliability_axis,
+    data=plot_df,
+    metrics=reliability_metrics,
+    show_polymer_labels=False,
+)
+
+add_protein_group_labels(
+    performance_axis
+)
+
+
+# ============================================================
+# 13. TITLES
+# ============================================================
+figure.suptitle(
+    "Absolute performance and relative value of adding polymer representations",
+    fontsize=14.6,
+    fontweight="bold",
+    y=0.985,
+)
+
+figure.text(
+    0.310,
+    0.925,
+    "A  Predictive performance",
+    ha="center",
+    va="center",
+    fontsize=11.8,
+    fontweight="bold",
+)
+
+figure.text(
+    0.575,
+    0.925,
+    "B  Computational cost",
+    ha="center",
+    va="center",
+    fontsize=11.8,
+    fontweight="bold",
+)
+
+figure.text(
+    0.795,
+    0.925,
+    "C  Reliability",
+    ha="center",
+    va="center",
+    fontsize=11.8,
+    fontweight="bold",
+)
+
+
+# ============================================================
+# 14. SHARED COLOR BAR WITH VERTICAL ARROW
+# ============================================================
+colorbar_axis = figure.add_axes(
+    [
+        0.905,   # left
+        0.285,   # bottom
+        0.016,   # width
+        0.430,   # height
+    ]
+)
+
+colorbar_mappable = ScalarMappable(
+    norm=Normalize(
+        vmin=0.0,
+        vmax=1.0,
+    ),
+    cmap=absolute_cmap,
+)
+
+colorbar_mappable.set_array([])
+
+shared_colorbar = figure.colorbar(
+    colorbar_mappable,
+    cax=colorbar_axis,
+    orientation="vertical",
+)
+
+# Remove tick labels to save horizontal space.
+shared_colorbar.set_ticks([])
+
+shared_colorbar.outline.set_linewidth(
+    0.7
+)
+
+# Add upward arrow beside the color bar.
+shared_colorbar.ax.annotate(
+    "",
+    xy=(
+        1.90,
+        0.98,
+    ),
+    xytext=(
+        1.90,
+        0.02,
+    ),
+    xycoords="axes fraction",
+    arrowprops=dict(
+        arrowstyle="-|>",
+        linewidth=1.35,
+        color="black",
+    ),
+)
+
+# Add vertical direction label.
+shared_colorbar.ax.text(
+    2.70,
+    0.50,
+    "Increasing favorability",
+    transform=shared_colorbar.ax.transAxes,
+    rotation=90,
+    ha="center",
+    va="center",
+    fontsize=8.8,
+    fontweight="bold",
+)
+
+
+# ============================================================
+# 15. FOOTNOTE AND LAYOUT
+# ============================================================
+figure.text(
+    0.47,
+    0.012,
+    (
+        "Cell colors represent absolute metric values, normalized separately "
+        "within each metric; printed values are relative percentage changes "
+        "versus the matching protein-only model. Green indicates more favorable "
+        "absolute performance or lower absolute cost."
+    ),
+    ha="center",
+    va="bottom",
+    fontsize=8.4,
+)
+
+figure.subplots_adjust(
+    left=0.155,
+    right=0.885,
+    top=0.845,
+    bottom=0.065,
+)
+
+
+# ============================================================
+# 16. SAVE
+# ============================================================
+figure.savefig(
+    OUTPUT_PNG,
+    dpi=600,
+    bbox_inches="tight",
+)
+
+figure.savefig(
+    OUTPUT_PDF,
+    bbox_inches="tight",
+)
+
+plt.show()
+
+
+# ============================================================
+# 17. REPORT
+# ============================================================
+print("\nSaved plotting dataset:")
+print(OUTPUT_CSV)
+
+print("\nSaved figure:")
+print(OUTPUT_PNG)
+print(OUTPUT_PDF)
+
+print("\nPreview:")
+print(
+    plot_df[
+        [
+            "protein_representation",
+            "polymer_representation",
+            "AUROC_change_pct",
+            "AUROC_absolute",
+            "AUPRC_change_pct",
+            "AUPRC_absolute",
+            "MCC_change_pct",
+            "MCC_absolute",
+            "feature_dimensions_change_pct",
+            "feature_dimensions_absolute",
+            "total_modeling_time_change_pct",
+            "total_modeling_time_s_absolute",
+            "ECE_improvement_pct",
+            "ECE_absolute",
+            "Brier_improvement_pct",
+            "Brier_absolute",
+            "Spearman_change_pct",
+            "Spearman_absolute",
+        ]
+    ].to_string(
+        index=False
+    )
+)
