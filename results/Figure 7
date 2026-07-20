@@ -1,0 +1,200 @@
+# =========================================================
+# UQ BOXPLOT (COMPACT VERSION — FULL CONTROL)
+# =========================================================
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import re
+
+# =========================================================
+# USER SETTINGS (MAIN CONTROLS)
+# =========================================================
+FILE_PATH = "/content/UQ_Unimodal.xlsx"
+UNIMODAL_SHEET = "Sheet1"
+POLYMER_SHEET = "Sheet2"
+
+OUTPUT_FIG = "/content/uq_boxplot_compact.png"
+
+# ---- Metrics ----
+METRICS = [
+    "MeanPredictiveEntropy",
+    "ECE",
+    "MCE",
+    "BrierScore",
+    "NLL",
+    "Corr_error_entropy",
+]
+
+SPLIT_ORDER = ["Random", "MMseqs2", "Leave-out-one"]
+
+# ---- Figure size (MAKE NARROWER HERE) ----
+FIGSIZE = (16, 18)
+
+# ---- BOX GEOMETRY (MOST IMPORTANT) ----
+BOX_WIDTH = 0.35     # thinner boxes
+BOX_STEP = 0.50      # spacing between boxes (reduce with width)
+
+POINT_JITTER = 0.06
+
+# ---- FONT CONTROL ----
+SIZE_SUPTITLE = 18
+SIZE_ROW_LABEL = 16
+SIZE_COL_TITLE = 16
+SIZE_YLABEL = 14
+SIZE_XTICKS = 14
+SIZE_YTICKS = 14
+
+ROTATION = 50
+POINT_SIZE = 16
+
+# =========================================================
+# HELPER
+# =========================================================
+def parse_mean_sd(val):
+    if pd.isna(val):
+        return np.nan, np.nan
+    if isinstance(val, (int, float)):
+        return float(val), 0.0
+    s = str(val)
+    if "±" in s:
+        a, b = s.split("±")
+        return float(a), float(b)
+    nums = re.findall(r"[-+]?\d*\.?\d+", s)
+    return (float(nums[0]), float(nums[1]) if len(nums) > 1 else 0.0)
+
+# =========================================================
+# LOAD DATA
+# =========================================================
+df_uni = pd.read_excel(FILE_PATH, sheet_name=UNIMODAL_SHEET)
+df_poly = pd.read_excel(FILE_PATH, sheet_name=POLYMER_SHEET)
+
+for df in [df_uni, df_poly]:
+    df.columns = [str(c).strip() for c in df.columns]
+    df["Modality"] = df["Modality"].astype(str).str.strip()
+
+# Parse metrics
+for metric in METRICS:
+    for df in [df_uni, df_poly]:
+        parsed = df[metric].apply(parse_mean_sd)
+        df[f"{metric}_mean"] = parsed.apply(lambda x: x[0])
+
+# =========================================================
+# FAMILIES
+# =========================================================
+families = [
+    ("Prot2Vec", "Prot2Vec", [
+        "Prot2vec + one-hot polymer label",
+        "Prot2vec + polymer chemistry descriptors",
+        "Prot2vec Transpolymer"
+    ]),
+    ("SeqDesc", "Sequence Descriptors", [
+        "Sequence descriptors + one-hot polymer label",
+        "Sequence descriptors + polymer chemistry descriptors",
+        "Sequence descriptors + Transpolymer"
+    ]),
+    ("ESM2", "ESM-2", [
+        "ESM2 + one-hot-polymer",
+        "ESM2 + Polymer Chemistry Descrptors",
+        "ESM2+ Transpolymer"
+    ]),
+    ("ProtBERT", "ProtBERT", [
+        "ProtBERT + one-hot-polymer",
+        "ProtBERT + Polymer Chemsitry Descriptors",
+        "ProtBERT + Transpolymer"
+    ])
+]
+
+# =========================================================
+# COLORS
+# =========================================================
+box_colors = ["#4C78A8", "#F58518", "#54A24B", "#E45756"]
+
+# =========================================================
+# FIGURE
+# =========================================================
+fig, axes = plt.subplots(4, 6, figsize=FIGSIZE)
+
+for r, (row_name, base_mod, poly_mods) in enumerate(families):
+    for c, metric in enumerate(METRICS):
+
+        ax = axes[r, c]
+
+        base_vals = df_uni[df_uni["Modality"] == base_mod][f"{metric}_mean"].dropna().tolist()
+
+        groups = [base_vals]
+        for m in poly_mods:
+            groups.append(
+                df_poly[df_poly["Modality"] == m][f"{metric}_mean"].dropna().tolist()
+            )
+
+        # ---- compact spacing ----
+        positions = np.arange(len(groups)) * BOX_STEP
+
+        bp = ax.boxplot(
+            groups,
+            positions=positions,
+            widths=BOX_WIDTH,
+            patch_artist=True,
+            showmeans=True
+        )
+
+        # ---- FIX: mean diamonds black ----
+        for mean in bp["means"]:
+            mean.set(
+                marker="D",
+                markerfacecolor="black",
+                markeredgecolor="black",
+                markersize=5
+            )
+
+        # ---- colors ----
+        for i, patch in enumerate(bp["boxes"]):
+            patch.set_facecolor(box_colors[i])
+            patch.set_edgecolor("black")
+
+        # ---- scatter overlay ----
+        rng = np.random.default_rng(42)
+        for i, vals in enumerate(groups):
+            jitter = rng.uniform(-POINT_JITTER, POINT_JITTER, size=len(vals))
+            ax.scatter(
+                np.full(len(vals), positions[i]) + jitter,
+                vals,
+                color="black",
+                s=POINT_SIZE,
+                alpha=0.6
+            )
+
+        # ---- titles ----
+        if r == 0:
+            ax.set_title(metric, fontsize=SIZE_COL_TITLE, fontweight="bold")
+
+        if c == 0:
+            ax.set_ylabel(row_name, fontsize=SIZE_YLABEL, fontweight="bold")
+
+        ax.set_xticks(positions)
+        ax.set_xticklabels(
+            ["Base", "+1Hot", "+PolyChem", "+TransPoly"],
+            rotation=ROTATION,
+            fontsize=SIZE_XTICKS
+        )
+
+        ax.tick_params(axis="y", labelsize=SIZE_YTICKS)
+        ax.grid(axis="y", linestyle=":", alpha=0.3)
+
+        # zero line for correlation
+        if metric == "Corr_error_entropy":
+            ax.axhline(0, linestyle=":", color="black", alpha=0.8)
+
+# =========================================================
+# TITLE
+# =========================================================
+fig.suptitle(
+    "Unimodal vs Polymer-Augmented Models (Compact Box Plot)",
+    fontsize=SIZE_SUPTITLE,
+    fontweight="bold"
+)
+
+plt.tight_layout(rect=[0, 0, 1, 0.96])
+plt.savefig(OUTPUT_FIG, dpi=600)
+plt.show()
