@@ -40,39 +40,37 @@ The repository also includes evaluation under:
 
 ```text
 Plastizymes/
+│
+├── README.md
+├── LICENSE
+├── environment.yml
+├── requirements.txt
+│
 ├── data/
 │   ├── raw/
-│   └── processed/
-│
-├── src/
-│   ├── data_processing.py
-│   ├── protbert_embeddings.py
-│   ├── esm2_embeddings.py
-│   ├── transpolymer_embeddings.py
-│   ├── multimodal_feature_builder.py
-│   ├── random_split_model.py
-│   ├── mmseqs_split_model.py
-│   ├── leave_one_polymer_family_split.py
-│   ├── modality_contribution_analysis.py
-│   └── uncertainty_analysis.py
-│
-├── notebooks/
-│   ├── 01_data_cleaning.ipynb
-│   ├── 02_embedding_generation.ipynb
-│   ├── 03_multimodal_features.ipynb
-│   ├── 04_model_training.ipynb
-│   ├── 05_modality_contribution.ipynb
-│   └── 06_uncertainty_analysis.ipynb
-│
-├── results/
-│   ├── figures/
-│   └── tables/
+│   ├── processed/
+│   └── README.md
 │
 ├── models/
-├── requirements.txt
-├── .gitignore
-├── LICENSE
-└── README.md
+│
+├── notebooks/
+│
+├── scripts/
+│
+├── results/
+│   ├── Figure1_Dataset_Curation/
+│   ├── Figure2_Multimodal_Representations/
+│   ├── Figure3_Progressive_Fusion/
+│   ├── Figure4_Model_Performance/
+│   ├── Figure5_Uncertainty/
+│   ├── Figure6_Interpretability/
+│   ├── Figure7_Cost_Benefit/
+│   ├── Supplementary/
+│   └── README.md
+│
+├── figures/
+│
+└── docs/
 ```
 
 ---
