@@ -1,0 +1,356 @@
+# =========================================================
+# MULTIMODAL FUSION BAR PLOT — INCLUDING polyBERT
+# Abbreviated legend names: P2V, PB, TP, pBERT, GAT, etc.
+# =========================================================
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import re
+
+plt.rcParams.update(plt.rcParamsDefault)
+
+# =========================================================
+# USER SETTINGS
+# =========================================================
+FILE_PATH = "/content/Multimodal Fusion.xlsx"
+SHEET_NAME = 0
+OUTPUT_FIG = "/content/multimodal_fusion_barplot_with_polybert.png"
+
+METRICS = ["AUROC", "AUPRC", "BA", "MCC"]
+SPLIT_ORDER = ["Random", "MMseqs2", "Leave-one-out"]
+
+# =========================================================
+# FONT SIZE SETTINGS
+# =========================================================
+SIZE_SUPTITLE = 20
+SIZE_TITLE = 20
+SIZE_YLABEL = 22
+SIZE_XTICKS = 22
+SIZE_YTICKS = 20
+SIZE_SPLIT_LABEL = 22
+SIZE_LEGEND = 22
+
+# =========================================================
+# PLOT SETTINGS
+# =========================================================
+FIGSIZE = (26, 24)
+BAR_WIDTH = 0.82
+ROTATION = 65
+ERROR_CAPSIZE = 3
+SECTION_GAP = 2.8
+LEGEND_NCOL = 3
+
+# =========================================================
+# LOAD DATA
+# =========================================================
+df = pd.read_excel(FILE_PATH, sheet_name=SHEET_NAME)
+df.columns = [str(c).strip() for c in df.columns]
+
+required_cols = ["Modality", "Model", "Data Split"] + METRICS
+missing_cols = [c for c in required_cols if c not in df.columns]
+if missing_cols:
+    raise ValueError(f"Missing required columns: {missing_cols}")
+
+# =========================================================
+# CLEAN SPLIT NAMES
+# =========================================================
+df["Data Split"] = df["Data Split"].astype(str).str.strip()
+
+split_map = {
+    "Random": "Random",
+    "random": "Random",
+    "MMseqs2": "MMseqs2",
+    "mmseqs2": "MMseqs2",
+    "Leave-one-out": "Leave-one-out",
+    "Leave one out": "Leave-one-out",
+    "Leave-out-one": "Leave-one-out",
+    "Leave-one-polymer": "Leave-one-out",
+    "Leave-out-one polymer": "Leave-one-out",
+    "Leave-out-one polymer family": "Leave-one-out",
+    "LOPO": "Leave-one-out",
+}
+
+df["Data Split"] = df["Data Split"].replace(split_map)
+df = df[df["Data Split"].isin(SPLIT_ORDER)].copy()
+
+if df.empty:
+    raise ValueError("No rows remain after filtering for the desired split names.")
+
+# =========================================================
+# PARSE mean ± sd
+# =========================================================
+def parse_mean_sd(val):
+    if pd.isna(val):
+        return np.nan, np.nan
+
+    if isinstance(val, (int, float, np.integer, np.floating)):
+        return float(val), 0.0
+
+    s = str(val).strip()
+
+    if "±" in s:
+        left, right = s.split("±", 1)
+        return float(left.strip()), float(right.strip())
+
+    nums = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", s)
+
+    if len(nums) >= 2:
+        return float(nums[0]), float(nums[1])
+    elif len(nums) == 1:
+        return float(nums[0]), 0.0
+    else:
+        return np.nan, np.nan
+
+for metric in METRICS:
+    parsed = df[metric].apply(parse_mean_sd)
+    df[f"{metric}_mean"] = parsed.apply(lambda x: x[0])
+    df[f"{metric}_sd"] = parsed.apply(lambda x: x[1])
+
+# =========================================================
+# CLEAN LABEL FIELDS
+# =========================================================
+df["Modality"] = df["Modality"].astype(str).str.strip()
+df["Model"] = df["Model"].astype(str).str.strip()
+
+# =========================================================
+# SHORTEN LONG MODALITY NAMES FOR LEGEND ONLY
+# =========================================================
+short_names = {
+    "Stronger handcrafted sequence descriptors + sequence embedding + polymer chemistry descriptors + SMILES fingerprint":
+        "SeqDesc+SeqEmb+PolyChem+FP",
+
+    "Sequence embedding + polymer chemistry descriptors + SMILES fingerprint + Transpolymer2 embedding":
+        "SeqEmb+PolyChem+FP+TP",
+
+    "Strong handcrafted sequence descriptors + sequence embedding + polymer chemistry descriptors + SMILES fingerprint + GAT graph embeddings":
+        "SeqDesc+SeqEmb+PolyChem+FP+GAT",
+
+    "ProtBERT + ESM-2 concatenated embeddings + stronger handcrafted sequence descriptors + polymer chemistry descriptors + SMILES fingerprint + GAT graph embeddings":
+        "PB+ESM2+SeqDesc+PolyChem+FP+GAT",
+
+    "ProtBERT + ESM-2 concatenated embeddings + stronger handcrafted sequence descriptors + polymer chemistry descriptors + SMILES fingerprint + GAT graph embeddings + Transpolymer2 embeddings.":
+        "PB+ESM2+SeqDesc+PolyChem+FP+GAT+TP",
+
+    # NEW polyBERT-containing multimodal fusion results
+    "Sequence embedding + polymer chemistry descriptors + SMILES fingerprint + polyBERT  embedding":
+        "SeqEmb+PolyChem+FP+pBERT",
+
+    "ProtBERT + ESM-2 concatenated embeddings + stronger handcrafted sequence descriptors + polymer chemistry descriptors + SMILES fingerprint + GAT graph embeddings + polyBERT embeddings.":
+        "PB+ESM2+SeqDesc+PolyChem+FP+GAT+pBERT",
+}
+
+df["Modality_short"] = df["Modality"].map(short_names).fillna(df["Modality"])
+
+# Internal unique plotting identifier
+df["Plot_ID"] = df["Model"] + "-" + df["Modality_short"]
+
+# X-axis display label: model only
+df["X_Label"] = df["Model"]
+
+# Keep bar order from spreadsheet
+ordered_labels = df["Plot_ID"].drop_duplicates().tolist()
+
+plot_id_to_model = (
+    df[["Plot_ID", "X_Label"]]
+    .drop_duplicates()
+    .set_index("Plot_ID")["X_Label"]
+    .to_dict()
+)
+
+# =========================================================
+# COLORS BY SHORT MODALITY
+# =========================================================
+color_map = {
+    "SeqDesc+SeqEmb+PolyChem+FP": "#4C78A8",
+    "SeqEmb+PolyChem+FP+TP": "#F58518",
+    "SeqDesc+SeqEmb+PolyChem+FP+GAT": "#54A24B",
+    "PB+ESM2+SeqDesc+PolyChem+FP+GAT": "#E45756",
+    "PB+ESM2+SeqDesc+PolyChem+FP+GAT+TP": "#72B7B2",
+    "SeqEmb+PolyChem+FP+pBERT": "#B279A2",
+    "PB+ESM2+SeqDesc+PolyChem+FP+GAT+pBERT": "#9D755D",
+}
+
+plot_id_to_modality_short = (
+    df[["Plot_ID", "Modality_short"]]
+    .drop_duplicates()
+    .set_index("Plot_ID")["Modality_short"]
+    .to_dict()
+)
+
+def get_color(plot_id):
+    modality_short = plot_id_to_modality_short.get(plot_id, "Other")
+    return color_map.get(modality_short, "#7F7F7F")
+
+# =========================================================
+# BUILD X POSITIONS
+# =========================================================
+x_positions = {}
+section_centers = {}
+divider_positions = []
+
+current_x = 0.0
+
+for i, split in enumerate(SPLIT_ORDER):
+    x_positions[split] = {}
+    start_x = current_x
+
+    for plot_id in ordered_labels:
+        x_positions[split][plot_id] = current_x
+        current_x += 1.0
+
+    end_x = current_x - 1.0
+    section_centers[split] = (start_x + end_x) / 2.0
+
+    if i < len(SPLIT_ORDER) - 1:
+        divider_positions.append(current_x - 0.5 + SECTION_GAP / 2.0)
+
+    current_x += SECTION_GAP
+
+all_xticks = []
+all_xticklabels = []
+
+for split in SPLIT_ORDER:
+    for plot_id in ordered_labels:
+        all_xticks.append(x_positions[split][plot_id])
+        all_xticklabels.append(plot_id_to_model[plot_id])
+
+xmin = min(all_xticks)
+xmax = max(all_xticks)
+
+# =========================================================
+# CREATE FIGURE
+# =========================================================
+fig, axes = plt.subplots(4, 1, figsize=FIGSIZE, sharex=True)
+panel_letters = ["A", "B", "C", "D"]
+
+for ax, metric, letter in zip(axes, METRICS, panel_letters):
+
+    for split in SPLIT_ORDER:
+        df_split = df[df["Data Split"] == split].copy()
+
+        for plot_id in ordered_labels:
+            row = df_split[df_split["Plot_ID"] == plot_id]
+
+            if row.empty:
+                continue
+
+            mean_val = row[f"{metric}_mean"].values[0]
+            sd_val = row[f"{metric}_sd"].values[0]
+            xpos = x_positions[split][plot_id]
+
+            if pd.isna(mean_val):
+                continue
+
+            ax.bar(
+                xpos,
+                mean_val,
+                width=BAR_WIDTH,
+                yerr=None if pd.isna(sd_val) else sd_val,
+                capsize=ERROR_CAPSIZE,
+                color=get_color(plot_id),
+                edgecolor="black",
+                linewidth=0.7,
+                zorder=3,
+            )
+
+    for d in divider_positions:
+        ax.axvline(
+            d,
+            color="black",
+            linestyle="--",
+            linewidth=1.0,
+            alpha=0.8,
+            zorder=2,
+        )
+
+    ax.set_title(
+        f"({letter}) {metric}",
+        loc="left",
+        fontsize=SIZE_TITLE,
+        fontweight="bold",
+    )
+
+    ax.set_ylabel("Score", fontsize=SIZE_YLABEL)
+    ax.tick_params(axis="y", labelsize=SIZE_YTICKS)
+    ax.grid(axis="y", linestyle=":", alpha=0.35, zorder=1)
+    ax.set_axisbelow(True)
+
+    ax.margins(x=0)
+    ax.set_xlim(xmin - BAR_WIDTH / 2, xmax + BAR_WIDTH / 2)
+    ax.margins(y=0.12)
+
+    y_top = ax.get_ylim()[1]
+    for split in SPLIT_ORDER:
+        ax.text(
+            section_centers[split],
+            y_top * 1.02,
+            split,
+            ha="center",
+            va="bottom",
+            fontsize=SIZE_SPLIT_LABEL,
+            fontweight="bold",
+        )
+
+# =========================================================
+# X AXIS ONLY ON BOTTOM PANEL
+# =========================================================
+axes[-1].set_xticks(all_xticks)
+axes[-1].set_xticklabels(
+    all_xticklabels,
+    rotation=ROTATION,
+    ha="right",
+    fontsize=SIZE_XTICKS,
+)
+
+for ax in axes[:-1]:
+    ax.tick_params(axis="x", which="both", labelbottom=False)
+
+# =========================================================
+# LEGEND
+# =========================================================
+unique_modality_shorts = []
+
+for plot_id in ordered_labels:
+    mod_short = plot_id_to_modality_short.get(plot_id, "Other")
+    if mod_short not in unique_modality_shorts:
+        unique_modality_shorts.append(mod_short)
+
+legend_handles = [
+    plt.Rectangle(
+        (0, 0),
+        1,
+        1,
+        facecolor=color_map.get(mod, "#7F7F7F"),
+        edgecolor="black",
+    )
+    for mod in unique_modality_shorts
+]
+
+fig.legend(
+    legend_handles,
+    unique_modality_shorts,
+    loc="upper center",
+    bbox_to_anchor=(0.5, 0.975),
+    ncol=LEGEND_NCOL,
+    frameon=False,
+    fontsize=SIZE_LEGEND,
+    columnspacing=1.4,
+    handletextpad=0.6,
+)
+
+# =========================================================
+# SUPTITLE + SAVE
+# =========================================================
+fig.suptitle(
+    "Performance of Multimodal Fusion Models Across Data Splits Including pBERT",
+    fontsize=SIZE_SUPTITLE,
+    fontweight="bold",
+    y=0.998,
+)
+
+plt.tight_layout(rect=[0, 0, 1, 0.90])
+plt.savefig(OUTPUT_FIG, dpi=600, bbox_inches="tight")
+plt.show()
+
+print(f"Figure saved to: {OUTPUT_FIG}")
