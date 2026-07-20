@@ -1,0 +1,393 @@
+# =========================================================
+# 4 x 4 BOXPLOT GRID
+# Unimodal vs Unimodal + Polymer Representations
+# Includes PolyBERT
+# Keeps original style:
+#   - Auto y-axis scaling
+#   - Closed plot frames
+#   - No forced y-limits
+# =========================================================
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import re
+
+# =========================================================
+# USER SETTINGS
+# =========================================================
+UNIMODAL_FILE = "/content/Unimodal.xlsx"
+POLYMER_FILE = "/content/Unimodal_plus_polymer.xlsx"
+OUTPUT_FIG = "/content/boxplot_4x4_unimodal_vs_polymer_with_polybert.png"
+
+METRICS = ["AUROC", "AUPRC", "BA", "MCC"]
+SPLIT_ORDER = ["Random", "MMseqs2", "Leave-out-one"]
+USE_ONLY_THESE_SPLITS = True
+
+MODEL_ORDER = ["LightGBM", "XGBoost"]
+
+# =========================================================
+# FONT / STYLE
+# =========================================================
+SIZE_SUPTITLE = 20
+SIZE_ROW_LABEL = 16
+SIZE_COL_TITLE = 16
+SIZE_YLABEL = 16
+SIZE_XTICKS = 16
+SIZE_YTICKS = 16
+
+FIGSIZE = (18, 22)
+ROTATION = 40
+
+# =========================================================
+# BOX / SPACING CONTROL
+# =========================================================
+BOX_WIDTH = 0.30
+BOX_STEP = 0.52
+POINT_JITTER = 0.055
+POINT_SIZE = 16
+
+# =========================================================
+# HELPER: parse "mean ± sd"
+# =========================================================
+def parse_mean_sd(val):
+    if pd.isna(val):
+        return np.nan, np.nan
+
+    if isinstance(val, (int, float, np.integer, np.floating)):
+        return float(val), 0.0
+
+    s = str(val).strip()
+
+    if "±" in s:
+        left, right = s.split("±", 1)
+        return float(left.strip()), float(right.strip())
+
+    nums = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", s)
+
+    if len(nums) >= 2:
+        return float(nums[0]), float(nums[1])
+    elif len(nums) == 1:
+        return float(nums[0]), 0.0
+    else:
+        return np.nan, np.nan
+
+# =========================================================
+# LOAD DATA
+# =========================================================
+df_uni = pd.read_excel(UNIMODAL_FILE)
+df_poly = pd.read_excel(POLYMER_FILE)
+
+df_uni.columns = [str(c).strip() for c in df_uni.columns]
+df_poly.columns = [str(c).strip() for c in df_poly.columns]
+
+# =========================================================
+# CLEAN SPLIT / LABEL NAMES
+# =========================================================
+split_map = {
+    "Random": "Random",
+    "random": "Random",
+    "MMseqs2": "MMseqs2",
+    "mmseqs2": "MMseqs2",
+    "MMseqs3": "MMseqs2",
+    "MMseqs4": "MMseqs2",
+    "Leave-out-one": "Leave-out-one",
+    "Leave-one-out": "Leave-out-one",
+    "Leave one out": "Leave-out-one",
+    "Leave-one-polymer": "Leave-out-one",
+    "Leave-out-one polymer": "Leave-out-one",
+    "Leave-out-one polymer family": "Leave-out-one",
+    "LOPO": "Leave-out-one",
+}
+
+for df in [df_uni, df_poly]:
+    df["Data Split"] = df["Data Split"].astype(str).str.strip().replace(split_map)
+    df["Modality"] = df["Modality"].astype(str).str.strip()
+    df["Model"] = df["Model"].astype(str).str.strip()
+
+if USE_ONLY_THESE_SPLITS:
+    df_uni = df_uni[df_uni["Data Split"].isin(SPLIT_ORDER)].copy()
+    df_poly = df_poly[df_poly["Data Split"].isin(SPLIT_ORDER)].copy()
+
+df_uni = df_uni[df_uni["Model"].isin(MODEL_ORDER)].copy()
+df_poly = df_poly[df_poly["Model"].isin(MODEL_ORDER)].copy()
+
+# =========================================================
+# PARSE METRICS
+# =========================================================
+for metric in METRICS:
+    for df in [df_uni, df_poly]:
+        parsed = df[metric].apply(parse_mean_sd)
+        df[f"{metric}_mean"] = parsed.apply(lambda x: x[0])
+        df[f"{metric}_sd"] = parsed.apply(lambda x: x[1])
+
+# =========================================================
+# DEFINE FAMILIES
+# Exact modality names are matched to your Excel files
+# =========================================================
+families = [
+    {
+        "row_name": "Prot2Vec",
+        "base_unimodal": "Prot2Vec",
+        "polymer_variants": [
+            "Prot2vec + one-hot polymer label",
+            "Prot2vec + polymer chemistry descriptors",
+            "Prot2vec+Transpolymer",
+            "Prot2vec + PolyBERT",
+        ],
+        "display_labels": [
+            "Prot2Vec",
+            "+1HotPoly",
+            "+PolyChem",
+            "+TransPoly",
+            "+PolyBERT",
+        ],
+    },
+    {
+        "row_name": "Sequence descriptors",
+        "base_unimodal": "Sequence Descriptors",
+        "polymer_variants": [
+            "Sequence descriptors + one-hot polymer label",
+            "Sequence descriptors + polymer chemistry descriptors",
+            "Sequence descriptors + Transpolymer",
+            "Sequence descriptors + PolyBERT",
+        ],
+        "display_labels": [
+            "SeqDesc",
+            "+1HotPoly",
+            "+PolyChem",
+            "+TransPoly",
+            "+PolyBERT",
+        ],
+    },
+    {
+        "row_name": "ESM2",
+        "base_unimodal": "ESM-2",
+        "polymer_variants": [
+            "ESM2 + one-hot-polymer",
+            "ESM2 + Polymer Chemistry Descrptors",
+            "ESM2+ Transpolymer",
+            "ESM2 + PolyBERT",
+        ],
+        "display_labels": [
+            "ESM2",
+            "+1HotPoly",
+            "+PolyChem",
+            "+TransPoly",
+            "+PolyBERT",
+        ],
+    },
+    {
+        "row_name": "ProtBERT",
+        "base_unimodal": "ProtBERT",
+        "polymer_variants": [
+            "ProtBERT + one-hot-polymer",
+            "ProtBERT + Polymer Chemsitry Descriptors",
+            "ProtBERT + Transpolymer",
+            "ProtBERT +PolyBERT",
+        ],
+        "display_labels": [
+            "ProtBERT",
+            "+1HotPoly",
+            "+PolyChem",
+            "+TransPoly",
+            "+PolyBERT",
+        ],
+    },
+]
+
+# =========================================================
+# COLORS
+# =========================================================
+box_colors = {
+    0: "#4C78A8",
+    1: "#F58518",
+    2: "#54A24B",
+    3: "#E45756",
+    4: "#7570B3",
+}
+
+# =========================================================
+# HELPER TO EXTRACT VALUES
+# =========================================================
+def get_group_values(base_modality, polymer_modality_list, metric):
+    base_vals = (
+        df_uni.loc[df_uni["Modality"] == base_modality, f"{metric}_mean"]
+        .dropna()
+        .tolist()
+    )
+
+    polymer_vals = []
+
+    for mod in polymer_modality_list:
+        vals = (
+            df_poly.loc[df_poly["Modality"] == mod, f"{metric}_mean"]
+            .dropna()
+            .tolist()
+        )
+        polymer_vals.append(vals)
+
+    return [base_vals] + polymer_vals
+
+# =========================================================
+# CREATE FIGURE
+# =========================================================
+fig, axes = plt.subplots(4, 4, figsize=FIGSIZE)
+
+for row_idx, family in enumerate(families):
+    for col_idx, metric in enumerate(METRICS):
+
+        ax = axes[row_idx, col_idx]
+
+        all_groups = get_group_values(
+            family["base_unimodal"],
+            family["polymer_variants"],
+            metric,
+        )
+
+        positions = np.arange(len(all_groups)) * BOX_STEP
+
+        bp = ax.boxplot(
+            all_groups,
+            positions=positions,
+            widths=BOX_WIDTH,
+            patch_artist=True,
+            showmeans=True,
+            meanline=False,
+        )
+
+        for i, patch in enumerate(bp["boxes"]):
+            patch.set_facecolor(box_colors.get(i, "#7F7F7F"))
+            patch.set_edgecolor("black")
+            patch.set_linewidth(1.0)
+
+        for median in bp["medians"]:
+            median.set_color("black")
+            median.set_linewidth(1.5)
+
+        for whisker in bp["whiskers"]:
+            whisker.set_color("black")
+            whisker.set_linewidth(1.0)
+
+        for cap in bp["caps"]:
+            cap.set_color("black")
+            cap.set_linewidth(1.0)
+
+        for flier in bp["fliers"]:
+            flier.set(
+                marker="o",
+                markersize=4,
+                markerfacecolor="gray",
+                markeredgecolor="gray",
+                alpha=0.6,
+            )
+
+        for mean in bp["means"]:
+            mean.set(
+                marker="D",
+                markerfacecolor="black",
+                markeredgecolor="black",
+                markersize=5,
+            )
+
+        rng = np.random.default_rng(42 + row_idx * 10 + col_idx)
+
+        for i, vals in enumerate(all_groups):
+            if len(vals) == 0:
+                print(
+                    f"WARNING: No data found for "
+                    f"{family['row_name']} | {family['display_labels'][i]} | {metric}"
+                )
+                continue
+
+            jitter = rng.uniform(
+                -POINT_JITTER,
+                POINT_JITTER,
+                size=len(vals),
+            )
+
+            ax.scatter(
+                np.full(len(vals), positions[i]) + jitter,
+                vals,
+                color="black",
+                alpha=0.55,
+                s=POINT_SIZE,
+                zorder=3,
+            )
+
+        if row_idx == 0:
+            ax.set_title(
+                metric,
+                fontsize=SIZE_COL_TITLE,
+                fontweight="bold",
+            )
+
+        if col_idx == 0:
+            ax.set_ylabel(
+                f"{family['row_name']}\n{metric}",
+                fontsize=SIZE_YLABEL,
+                fontweight="bold",
+            )
+        else:
+            ax.set_ylabel(metric, fontsize=SIZE_YLABEL)
+
+        ax.set_xticks(positions)
+        ax.set_xticklabels(
+            family["display_labels"],
+            rotation=ROTATION,
+            ha="right",
+            fontsize=SIZE_XTICKS,
+        )
+
+        ax.tick_params(axis="y", labelsize=SIZE_YTICKS)
+        ax.grid(axis="y", linestyle=":", alpha=0.35)
+        ax.set_axisbelow(True)
+
+        # Keep closed frames exactly like your earlier style
+        for spine in ax.spines.values():
+            spine.set_visible(True)
+
+        ax.set_xlim(
+            positions[0] - BOX_STEP * 0.55,
+            positions[-1] + BOX_STEP * 0.55,
+        )
+
+# =========================================================
+# ROW ANNOTATIONS ON FAR LEFT
+# =========================================================
+row_y_positions = [0.88, 0.64, 0.40, 0.16]
+
+row_titles = [
+    "Prot2Vec family",
+    "Sequence descriptors family",
+    "ESM2 family",
+    "ProtBERT family",
+]
+
+for y, title in zip(row_y_positions, row_titles):
+    fig.text(
+        0.02,
+        y,
+        title,
+        rotation=90,
+        va="center",
+        ha="center",
+        fontsize=SIZE_ROW_LABEL,
+        fontweight="bold",
+    )
+
+# =========================================================
+# SUPTITLE + SAVE
+# =========================================================
+fig.suptitle(
+    "Comparison of Unimodal vs Unimodal + Polymer Representations Including PolyBERT",
+    fontsize=SIZE_SUPTITLE,
+    fontweight="bold",
+    y=0.995,
+)
+
+plt.tight_layout(rect=[0.04, 0, 1, 0.98])
+plt.savefig(OUTPUT_FIG, dpi=600, bbox_inches="tight")
+plt.show()
+
+print(f"Figure saved to: {OUTPUT_FIG}")
