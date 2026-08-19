@@ -1,4 +1,4 @@
-# Plastizymes: Multimodal Machine Learning for Plastic-Degrading Enzyme Prediction
+# Beyond Plastic Labels: Polymer-Aware Substrate Encoding Improves Plastizyme Prediction and Reliability Models
 
 This repository contains the full machine learning pipeline for the Plastizymes project. The goal is to predict plastic-degrading enzyme activity using multimodal features that combine protein sequence representations, polymer chemistry information, molecular fingerprints, and graph-based sequence embeddings.
 
